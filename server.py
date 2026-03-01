@@ -496,25 +496,29 @@ async def create_player(player: PlayerCreate):
 
 @api_router.post("/players/login", response_model=dict)
 async def login_player(login: PlayerLogin):
-    """Authenticate a player with username and password"""
-    player = await db.players.find_one({"username": login.username})
+    """Authenticate a player with username and password (case-insensitive username)"""
+    import re
+    
+    # Case-insensitive username search
+    player = await db.players.find_one({
+        "username": {"$regex": f"^{re.escape(login.username)}$", "$options": "i"}
+    })
     
     if not player:
-        raise HTTPException(status_code=404, detail="Username not found")
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
     
     # Check if this is an old account without password (needs migration)
     if 'password_hash' not in player:
         raise HTTPException(status_code=400, detail="Account needs password setup. Please contact support.")
     
     if not verify_password(login.password, player['password_hash']):
-        raise HTTPException(status_code=401, detail="Incorrect password")
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
     
     # Return player data (without password hash)
     player_data = serialize_doc(player)
     if 'password_hash' in player_data:
         del player_data['password_hash']
     return player_data
-
 @api_router.get("/players", response_model=List[dict])
 async def get_players():
     # Exclude password_hash at query time for security and performance
