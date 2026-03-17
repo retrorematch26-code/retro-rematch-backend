@@ -14,7 +14,7 @@ router = APIRouter(prefix="/api/forum", tags=["forum"])
 
 # MongoDB connection
 client = MongoClient(os.environ.get('MONGO_URL'))
-db = client[os.environ.get('DB_NAME', 'retro_rematch')]
+db = client[os.environ.get('DB_NAME', 'test_database')]
 
 def serialize_doc(doc):
     """Convert MongoDB document to JSON-serializable dict"""
@@ -51,7 +51,20 @@ async def get_categories():
 
 @router.post("/categories")
 async def create_category(category: dict):
-    """Create a new forum category (admin only)"""
+    """Create a new forum category (master admin only)"""
+    creator_id = category.get('created_by')
+    if not creator_id:
+        raise HTTPException(status_code=400, detail="Creator ID is required")
+    
+    # Check if creator is a master admin
+    try:
+        creator = db.players.find_one({"_id": ObjectId(creator_id)})
+    except:
+        creator = db.players.find_one({"_id": creator_id})
+    
+    if not creator or not creator.get('is_master_admin'):
+        raise HTTPException(status_code=403, detail="Only master admin can create forum categories")
+    
     category['created_at'] = datetime.now(timezone.utc)
     result = db.forum_categories.insert_one(category)
     category['_id'] = str(result.inserted_id)
@@ -59,7 +72,23 @@ async def create_category(category: dict):
 
 @router.put("/categories/{category_id}")
 async def update_category(category_id: str, updates: dict):
-    """Update a category (admin only)"""
+    """Update a category (master admin only)"""
+    updater_id = updates.get('updated_by')
+    if not updater_id:
+        raise HTTPException(status_code=400, detail="Updater ID is required")
+    
+    # Check if updater is a master admin
+    try:
+        updater = db.players.find_one({"_id": ObjectId(updater_id)})
+    except:
+        updater = db.players.find_one({"_id": updater_id})
+    
+    if not updater or not updater.get('is_master_admin'):
+        raise HTTPException(status_code=403, detail="Only master admin can update forum categories")
+    
+    # Remove updated_by from the updates so it's not stored
+    updates.pop('updated_by', None)
+    
     db.forum_categories.update_one(
         {"_id": ObjectId(category_id)},
         {"$set": updates}
@@ -67,8 +96,20 @@ async def update_category(category_id: str, updates: dict):
     return {"success": True}
 
 @router.delete("/categories/{category_id}")
-async def delete_category(category_id: str):
-    """Delete a category (admin only)"""
+async def delete_category(category_id: str, deleted_by: str = None):
+    """Delete a category (master admin only)"""
+    if not deleted_by:
+        raise HTTPException(status_code=400, detail="Deleter ID is required")
+    
+    # Check if deleter is a master admin
+    try:
+        deleter = db.players.find_one({"_id": ObjectId(deleted_by)})
+    except:
+        deleter = db.players.find_one({"_id": deleted_by})
+    
+    if not deleter or not deleter.get('is_master_admin'):
+        raise HTTPException(status_code=403, detail="Only master admin can delete forum categories")
+    
     db.forum_categories.delete_one({"_id": ObjectId(category_id)})
     return {"success": True}
 
@@ -563,7 +604,21 @@ async def get_moderators():
 
 @router.post("/moderators")
 async def add_moderator(mod_data: dict):
-    """Add a new moderator (admin only)"""
+    """Add a new moderator (master admin only)"""
+    # Verify the appointer is a master admin
+    appointer_id = mod_data.get('appointed_by')
+    if not appointer_id:
+        raise HTTPException(status_code=400, detail="Appointer ID is required")
+    
+    # Check if appointer is a master admin
+    try:
+        appointer = db.players.find_one({"_id": ObjectId(appointer_id)})
+    except:
+        appointer = db.players.find_one({"_id": appointer_id})
+    
+    if not appointer or not appointer.get('is_master_admin'):
+        raise HTTPException(status_code=403, detail="Only master admin can appoint forum moderators")
+    
     # Check if player exists
     player = db.players.find_one({"_id": ObjectId(mod_data['player_id'])})
     if not player:
@@ -583,7 +638,7 @@ async def add_moderator(mod_data: dict):
         "can_delete": mod_data.get('can_delete', True),
         "can_edit": mod_data.get('can_edit', True),
         "can_ban": mod_data.get('can_ban', False),
-        "appointed_by": mod_data['appointed_by'],
+        "appointed_by": appointer_id,
         "appointed_at": datetime.now(timezone.utc)
     }
     
@@ -592,8 +647,20 @@ async def add_moderator(mod_data: dict):
     return mod
 
 @router.delete("/moderators/{mod_id}")
-async def remove_moderator(mod_id: str):
-    """Remove a moderator (admin only)"""
+async def remove_moderator(mod_id: str, removed_by: str = None):
+    """Remove a moderator (master admin only)"""
+    if not removed_by:
+        raise HTTPException(status_code=400, detail="Remover ID is required")
+    
+    # Check if remover is a master admin
+    try:
+        remover = db.players.find_one({"_id": ObjectId(removed_by)})
+    except:
+        remover = db.players.find_one({"_id": removed_by})
+    
+    if not remover or not remover.get('is_master_admin'):
+        raise HTTPException(status_code=403, detail="Only master admin can remove forum moderators")
+    
     db.forum_moderators.delete_one({"_id": ObjectId(mod_id)})
     return {"success": True}
 
@@ -694,3 +761,109 @@ async def get_forum_stats():
         "newest_member": serialize_doc(db.players.find_one(sort=[("created_at", DESCENDING)])),
         "latest_post": serialize_doc(db.forum_posts.find_one({"is_deleted": False}, sort=[("created_at", DESCENDING)]))
     }
+
+# ============ ADMIN MANAGEMENT ============
+
+@router.get("/admin/check/{player_id}")
+async def check_admin_status(player_id: str):
+    """Check if a player is a master admin"""
+    player = None
+    try:
+        player = db.players.find_one({"_id": ObjectId(player_id)})
+    except Exception as e:
+        print(f"[Admin Check] Error with ObjectId: {e}")
+        try:
+            player = db.players.find_one({"_id": player_id})
+        except Exception as e2:
+            print(f"[Admin Check] Error with string: {e2}")
+    
+    if not player:
+        print(f"[Admin Check] Player not found: {player_id}")
+        return {"is_master_admin": False, "role": None}
+    
+    print(f"[Admin Check] Found player: {player.get('username')}, is_master_admin: {player.get('is_master_admin')}")
+    return {
+        "is_master_admin": player.get('is_master_admin', False),
+        "role": player.get('role', 'user')
+    }
+
+@router.post("/admin/grant")
+async def grant_admin(data: dict):
+    """Grant admin role to a player (master admin only)"""
+    granter_id = data.get('granter_id')
+    target_player_id = data.get('player_id')
+    role = data.get('role', 'admin')  # 'admin' or 'moderator'
+    
+    if not granter_id or not target_player_id:
+        raise HTTPException(status_code=400, detail="Granter ID and Player ID are required")
+    
+    # Check if granter is master admin
+    try:
+        granter = db.players.find_one({"_id": ObjectId(granter_id)})
+    except:
+        granter = db.players.find_one({"_id": granter_id})
+    
+    if not granter or not granter.get('is_master_admin'):
+        raise HTTPException(status_code=403, detail="Only master admin can grant admin roles")
+    
+    # Update target player
+    try:
+        result = db.players.update_one(
+            {"_id": ObjectId(target_player_id)},
+            {"$set": {"role": role, "is_admin": role in ['admin', 'master_admin']}}
+        )
+    except:
+        result = db.players.update_one(
+            {"_id": target_player_id},
+            {"$set": {"role": role, "is_admin": role in ['admin', 'master_admin']}}
+        )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Player not found")
+    
+    return {"success": True, "message": f"Granted {role} role to player"}
+
+@router.post("/admin/revoke")
+async def revoke_admin(data: dict):
+    """Revoke admin role from a player (master admin only)"""
+    revoker_id = data.get('revoker_id')
+    target_player_id = data.get('player_id')
+    
+    if not revoker_id or not target_player_id:
+        raise HTTPException(status_code=400, detail="Revoker ID and Player ID are required")
+    
+    # Check if revoker is master admin
+    try:
+        revoker = db.players.find_one({"_id": ObjectId(revoker_id)})
+    except:
+        revoker = db.players.find_one({"_id": revoker_id})
+    
+    if not revoker or not revoker.get('is_master_admin'):
+        raise HTTPException(status_code=403, detail="Only master admin can revoke admin roles")
+    
+    # Update target player
+    try:
+        result = db.players.update_one(
+            {"_id": ObjectId(target_player_id)},
+            {"$set": {"role": "user", "is_admin": False}}
+        )
+    except:
+        result = db.players.update_one(
+            {"_id": target_player_id},
+            {"$set": {"role": "user", "is_admin": False}}
+        )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Player not found")
+    
+    return {"success": True, "message": "Revoked admin role from player"}
+
+@router.get("/admins")
+async def get_all_admins():
+    """Get list of all admins and moderators"""
+    admins = list(db.players.find(
+        {"$or": [{"is_master_admin": True}, {"is_admin": True}, {"role": {"$in": ["admin", "master_admin", "moderator"]}}]},
+        {"username": 1, "role": 1, "is_master_admin": 1, "is_admin": 1, "email": 1}
+    ))
+    return [serialize_doc(a) for a in admins]
+

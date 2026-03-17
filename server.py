@@ -97,6 +97,14 @@ class PlayerLogin(BaseModel):
     username: str
     password: str
 
+class ForgotPasswordRequest(BaseModel):
+    username: str
+    email: str
+
+class ResetPasswordRequest(BaseModel):
+    reset_token: str
+    new_password: str
+
 class PlayerUpdate(BaseModel):
     username: Optional[str] = None
     avatar: Optional[str] = None
@@ -157,6 +165,7 @@ class ClanUpdate(BaseModel):
     discord_link: Optional[str] = None
     twitch_link: Optional[str] = None
     avatar_icon: Optional[str] = None  # Preset avatar icon ID
+    tag: Optional[str] = None  # Clan tag prefix
 
 # Preset retro 2000s gaming avatars for clans
 CLAN_AVATAR_PRESETS = [
@@ -307,6 +316,8 @@ class FlashMatchScoreReport(BaseModel):
     maps_won_b: int
     team_a_kills: List[dict]  # [{"name": "player1", "kills": 10}, ...]
     team_b_kills: List[dict]  # [{"name": "player2", "kills": 8}, ...]
+    reporter_id: Optional[str] = None  # ID of the player reporting the score
+    reporter_name: Optional[str] = None  # Name of the player reporting (for quick match participants)
 
 # ==================== CASH TOURNAMENT MODELS ====================
 
@@ -519,6 +530,104 @@ async def login_player(login: PlayerLogin):
     if 'password_hash' in player_data:
         del player_data['password_hash']
     return player_data
+
+@api_router.post("/players/forgot-password")
+async def forgot_password(request: ForgotPasswordRequest):
+    """Request a password reset. Requires username and email for verification."""
+    import re
+    import secrets
+    from datetime import datetime, timedelta
+    
+    # Case-insensitive username search
+    player = await db.players.find_one({
+        "username": {"$regex": f"^{re.escape(request.username)}$", "$options": "i"}
+    })
+    
+    if not player:
+        # Don't reveal if username exists for security
+        return {"message": "If an account with that username and email exists, you will receive reset instructions."}
+    
+    # Check if player has email set
+    player_email = player.get('email', '').lower().strip()
+    request_email = request.email.lower().strip()
+    
+    if not player_email or player_email != request_email:
+        # Don't reveal if email matches for security
+        return {"message": "If an account with that username and email exists, you will receive reset instructions."}
+    
+    # Generate reset token
+    reset_token = secrets.token_urlsafe(32)
+    reset_expires = datetime.utcnow() + timedelta(hours=1)
+    
+    # Store reset token in database
+    await db.players.update_one(
+        {"_id": player["_id"]},
+        {"$set": {
+            "reset_token": reset_token,
+            "reset_token_expires": reset_expires
+        }}
+    )
+    
+    # For now, return the token directly (in production, this would be emailed)
+    # TODO: Integrate email service to send reset link
+    return {
+        "message": "Password reset token generated.",
+        "reset_token": reset_token,
+        "note": "In production, this token would be emailed to you. For now, use this token to reset your password."
+    }
+
+@api_router.post("/players/reset-password")
+async def reset_password(request: ResetPasswordRequest):
+    """Reset password using a valid reset token."""
+    from datetime import datetime
+    
+    if len(request.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    
+    # Find player with this reset token
+    player = await db.players.find_one({
+        "reset_token": request.reset_token,
+        "reset_token_expires": {"$gt": datetime.utcnow()}
+    })
+    
+    if not player:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+    
+    # Hash the new password
+    new_password_hash = hash_password(request.new_password)
+    
+    # Update password and remove reset token
+    await db.players.update_one(
+        {"_id": player["_id"]},
+        {
+            "$set": {"password_hash": new_password_hash},
+            "$unset": {"reset_token": "", "reset_token_expires": ""}
+        }
+    )
+    
+    return {"message": "Password has been reset successfully. You can now log in with your new password."}
+
+@api_router.post("/players/{player_id}/set-email")
+async def set_player_email(player_id: str, email: str):
+    """Set or update player's email for password recovery."""
+    import re
+    
+    # Basic email validation
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if not re.match(email_pattern, email):
+        raise HTTPException(status_code=400, detail="Invalid email format")
+    
+    try:
+        result = await db.players.update_one(
+            {"_id": ObjectId(player_id)},
+            {"$set": {"email": email.lower().strip()}}
+        )
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Player not found")
+        return {"message": "Email updated successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 @api_router.get("/players", response_model=List[dict])
 async def get_players():
     # Exclude password_hash at query time for security and performance
@@ -858,6 +967,48 @@ async def leave_clan(clan_id: str, player_id: str):
         )
     
     return {"message": "Successfully left clan"}
+
+@api_router.delete("/clans/{clan_id}", response_model=dict)
+async def delete_clan(clan_id: str, leader_id: str):
+    """Delete a clan (leader only)"""
+    try:
+        clan = await db.clans.find_one({"_id": ObjectId(clan_id)})
+    except:
+        raise HTTPException(status_code=400, detail="Invalid clan ID format")
+    
+    if not clan:
+        raise HTTPException(status_code=404, detail="Clan not found")
+    
+    if clan.get('leader_id') != leader_id:
+        raise HTTPException(status_code=403, detail="Only the clan leader can delete the clan")
+    
+    # Clear clan_id from all members
+    member_ids = clan.get('members', [])
+    for member_id in member_ids:
+        try:
+            await db.players.update_one(
+                {"_id": ObjectId(member_id)},
+                {"$set": {"clan_id": None}}
+            )
+        except:
+            pass
+    
+    # Delete the clan
+    await db.clans.delete_one({"_id": ObjectId(clan_id)})
+    
+    # Also delete any pending invites for this clan
+    await db.clan_invites.delete_many({"clan_id": clan_id})
+    
+    # Delete any pending challenges involving this clan
+    await db.challenges.delete_many({
+        "$or": [
+            {"challenger_id": clan_id},
+            {"challenged_id": clan_id}
+        ],
+        "status": "pending"
+    })
+    
+    return {"message": "Clan deleted successfully"}
 
 @api_router.post("/clans/{clan_id}/kick/{member_id}", response_model=dict)
 async def kick_member(clan_id: str, member_id: str, requester_id: str):
@@ -1322,6 +1473,34 @@ async def decline_clan_invite(invite_id: str, player_id: str):
     updated_invite = await db.clan_invites.find_one({"_id": ObjectId(invite_id)})
     return serialize_doc(updated_invite)
 
+@api_router.delete("/clan-invites/{invite_id}", response_model=dict)
+async def cancel_clan_invite(invite_id: str, canceller_id: str):
+    """Cancel a pending clan invite. Only the inviter (leader/captain) can cancel."""
+    try:
+        invite = await db.clan_invites.find_one({"_id": ObjectId(invite_id)})
+    except:
+        raise HTTPException(status_code=400, detail="Invalid invite ID")
+    
+    if not invite:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    
+    if invite['status'] != 'pending':
+        raise HTTPException(status_code=400, detail="Can only cancel pending invites")
+    
+    # Check if canceller is the inviter OR is leader/captain of the clan
+    clan = await db.clans.find_one({"_id": ObjectId(invite['clan_id'])})
+    if not clan:
+        raise HTTPException(status_code=404, detail="Clan not found")
+    
+    is_inviter = invite.get('invited_by_id') == canceller_id
+    is_leader_or_captain = canceller_id in [clan.get('leader_id'), clan.get('captain_id')]
+    
+    if not is_inviter and not is_leader_or_captain:
+        raise HTTPException(status_code=403, detail="Only the inviter or clan leader/captain can cancel invites")
+    
+    await db.clan_invites.delete_one({"_id": ObjectId(invite_id)})
+    return {"message": "Invite cancelled successfully"}
+
 # ==================== CHALLENGE ROUTES ====================
 
 @api_router.post("/challenges", response_model=dict)
@@ -1450,6 +1629,11 @@ async def accept_challenge(challenge_id: str, accepter_id: str):
         {"$set": {"status": "accepted", "match_id": match_id}}
     )
     
+    # Add system event messages to the new match lobby chat
+    from routes.match_lobby import add_system_message
+    await add_system_message(match_id, f"Match created: {challenger_clan['name']} vs {challenged_clan['name']}")
+    await add_system_message(match_id, f"Challenge accepted by {challenged_clan['name']}")
+    
     challenge = await db.challenges.find_one({"_id": ObjectId(challenge_id)})
     return serialize_doc(challenge)
 
@@ -1553,7 +1737,7 @@ async def get_quick_match(match_id: str):
 
 @api_router.post("/quick-matches/{match_id}/report", response_model=dict)
 async def report_quick_match(match_id: str, report: FlashMatchScoreReport):
-    """Report final score and kills for a quick match"""
+    """Report final score and kills for a quick match (participants only)"""
     try:
         match = await db.quick_matches.find_one({"_id": ObjectId(match_id)})
     except:
@@ -1564,6 +1748,31 @@ async def report_quick_match(match_id: str, report: FlashMatchScoreReport):
     
     if match.get('status') == 'completed':
         raise HTTPException(status_code=400, detail="Match already completed")
+    
+    # Check if reporter is a participant in the match
+    reporter_id = report.reporter_id if hasattr(report, 'reporter_id') else None
+    reporter_name = report.reporter_name if hasattr(report, 'reporter_name') else None
+    
+    if not reporter_id and not reporter_name:
+        raise HTTPException(status_code=400, detail="Reporter identification is required")
+    
+    # Get all participant names from both teams
+    team_a_names = [p['name'].lower() for p in match['team_a']['players']]
+    team_b_names = [p['name'].lower() for p in match['team_b']['players']]
+    all_participants = team_a_names + team_b_names
+    
+    # Check if reporter is a participant (by name or by looking up their username)
+    is_participant = False
+    if reporter_name and reporter_name.lower() in all_participants:
+        is_participant = True
+    elif reporter_id:
+        # Look up the reporter's username
+        reporter = await db.players.find_one({"_id": ObjectId(reporter_id)})
+        if reporter and reporter.get('username', '').lower() in all_participants:
+            is_participant = True
+    
+    if not is_participant:
+        raise HTTPException(status_code=403, detail="Only match participants can report scores")
     
     game = match.get('game', 'Rainbow Six 3')
     
@@ -3224,6 +3433,14 @@ app.include_router(api_router)
 # Include forum routes
 from routes.forum import router as forum_router
 app.include_router(forum_router)
+
+# Include IAP routes
+from routes.iap import router as iap_router
+app.include_router(iap_router, prefix="/api")
+
+# Include match lobby routes
+from routes.match_lobby import router as match_lobby_router
+app.include_router(match_lobby_router)
 
 app.add_middleware(
     CORSMiddleware,
